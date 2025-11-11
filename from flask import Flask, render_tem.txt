@@ -1,0 +1,192 @@
+from flask import Flask, render_template, request, jsonify
+import os
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+import fitz
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = os.path.join('static', 'uploads')
+app.config['GRAPH_FOLDER'] = os.path.join('static', 'graphs')
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['GRAPH_FOLDER'], exist_ok=True)
+
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "pdf"}
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+# Threshold for matching
+THRESHOLD = 0.30
+
+
+def allowed_file(filename):
+    """Check if file type is allowed."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def extract_image_from_pdf(filepath):
+    """Extract the first page of a PDF as an image."""
+    doc = fitz.open(filepath)
+    if len(doc) == 0:
+        raise ValueError("Empty PDF")
+    page = doc[0]
+    pix = page.get_pixmap()
+    img_path = filepath + "_page1.png"
+    pix.save(img_path)
+    return Image.open(img_path).convert("RGB"), img_path
+
+
+def preprocess_image(file):
+    """Open image or extract from PDF."""
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    file.save(filepath)
+
+    if file.filename.lower().endswith(".pdf"):
+        image, img_path = extract_image_from_pdf(filepath)
+        display_image = os.path.join("uploads", os.path.basename(img_path))
+    else:
+        image = Image.open(filepath).convert("RGB")
+        display_image = os.path.join("uploads", os.path.basename(filepath))
+
+    return image, display_image
+
+
+def analyze_quality(image):
+    """Compute image quality metrics (blur, resolution, aspect ratio)."""
+    width, height = image.size
+    aspect_ratio = round(width / height, 2)
+    cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    issues = []
+    if blur_score < 100:
+        issues.append("Blurry image")
+    if width < 300 or height < 300:
+        issues.append("Low resolution")
+    if not issues:
+        issues = ["None"]
+
+    return width, height, aspect_ratio, blur_score, issues
+
+
+def generate_graph(metrics, values, filename):
+    """Generate normalized graph for metrics visualization."""
+    max_val = max(values)
+    norm_values = [v / max_val for v in values]
+
+    plt.figure(figsize=(6, 4))
+    bars = plt.bar(metrics, norm_values, color=['#4caf50', '#2196f3', '#ff9800'], alpha=0.85)
+
+    for bar, val, raw in zip(bars, norm_values, values):
+        plt.text(bar.get_x() + bar.get_width()/2, val + 0.02, f"{raw:.2f}", ha='center', fontsize=9)
+
+    plt.title('Image Analysis Metrics (Normalized)', fontsize=13, fontweight='bold')
+    plt.xlabel('Metric', fontsize=11)
+    plt.ylabel('Normalized Value (0–1)', fontsize=11)
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+
+    graph_path = os.path.join(app.config['GRAPH_FOLDER'], filename)
+    plt.savefig(graph_path)
+    plt.close()
+
+    return os.path.join("graphs", filename)
+
+
+# ---------------- Core Validation Logic ----------------
+def compute_clip_similarity(image, description):
+    """Compute image-text similarity using CLIP."""
+    candidates = [
+        description,
+        f"a photo of {description}",
+        f"a product photo of {description}",
+        "a close-up product photo",
+        "a photo of an iPhone 16",
+        "a photo of a smartphone"
+    ]
+    captions = list(dict.fromkeys(candidates))
+
+    inputs = processor(text=captions, images=image, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        image_embeds = F.normalize(outputs.image_embeds, p=2, dim=-1)
+        text_embeds = F.normalize(outputs.text_embeds, p=2, dim=-1)
+        sims = (image_embeds @ text_embeds.T).squeeze(0)
+
+    best_idx = int(sims.argmax().cpu().item())
+    best_score = float(sims[best_idx].cpu().item())
+    best_caption = captions[best_idx]
+    return best_score, best_caption
+
+
+
+@app.route('/')
+def index():
+    """Render homepage."""
+    return render_template('index.html')
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle image upload and correctness analysis."""
+    file = request.files.get('file')
+    description = request.form.get('description', '').strip()
+
+    if not file or not allowed_file(file.filename):
+        return "❌ Invalid file type or no file uploaded.", 400
+    if not description:
+        return "❌ Description cannot be empty.", 400
+
+    try:
+        image, display_image = preprocess_image(file)
+    except Exception as e:
+        return f"❌ Error processing file: {e}", 400
+
+    best_score, best_caption = compute_clip_similarity(image, description)
+    matched = best_score >= THRESHOLD
+    status = "✅ ACCEPTED" if matched else "❌ REJECTED"
+    decision = "Image matches description" if matched else "Image does not match description"
+
+    width, height, aspect_ratio, blur_score, issues = analyze_quality(image)
+
+    # Graph
+    metrics = ["CLIP Score", "Blur Score", "Resolution (x10⁵)"]
+    values = [best_score, blur_score, (width * height) / 100000]
+    graph_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_graph.png"
+    graph_path = generate_graph(metrics, values, graph_filename)
+
+    result_text = (
+        f"Status: {status}\n"
+        f"Best Match Caption: {best_caption}\n"
+        f"CLIP Similarity Score: {best_score:.3f}\n"
+        f"Blur Score: {blur_score:.2f}\n"
+        f"Resolution: {width} × {height}\n"
+        f"Aspect Ratio: {aspect_ratio}\n"
+        f"Quality Issues: {', '.join(issues)}\n"
+        f"Decision: {decision}"
+    )
+
+    return render_template(
+        'result.html',
+        image=display_image,
+        desc=description,
+        result=result_text,
+        graph=graph_path
+    )
+
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
